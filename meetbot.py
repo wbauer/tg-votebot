@@ -20,9 +20,12 @@ import os
 import sys
 
 from telegram import (ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
-                      CallbackQuery)
+                      CallbackQuery, ChosenInlineResult, InlineQuery, InlineQueryResult, InlineQueryResultArticle,
+                      InputMessageContent, InputTextMessageContent)
 from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters, RegexHandler,
-                          ConversationHandler, CallbackQueryHandler)
+                          ConversationHandler, CallbackQueryHandler, ChosenInlineResultHandler,
+                          InlineQueryHandler)
+
 
 # from survey import Survey
 
@@ -35,13 +38,11 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 TITLE, DESCRIPTION, SETTINGS, OPTIONS = range(4)
 
 settings_keyboard = [['YES/NO', 'YES/MAYBE/NO']]
 
 import time, threading, pickle
-
 
 
 class SurveyOption:
@@ -107,10 +108,12 @@ def getSurveyById(survey_id):
         c.execute(
             'SELECT ROWID,user_id,title,description,setting_maybe FROM surveys WHERE ROWID=? ORDER BY ROWID DESC', t)
         s = c.fetchone()
+        conn.close()
         if (s == None):
             logger.info("No survey with id %s found", t)
+            return None
 
-        conn.close()
+
     except Exception as e:
         logger.warning("failed to retrieve survey: %s", e)
     return s
@@ -220,7 +223,7 @@ def description(bot, update):
         conn.commit()
         conn.close()
     logger.info("Description of %s: %s", user.first_name, update.message.text)
-    update.message.reply_text('OK. Now select some settings'
+    update.message.reply_text('OK. Now select some settings.\n'
                               'Should the user have a maybe option?',
                               reply_markup=ReplyKeyboardMarkup(settings_keyboard, one_time_keyboard=True))
 
@@ -230,7 +233,7 @@ def description(bot, update):
 def skip_description(bot, update):
     user = update.message.from_user
     logger.info("No description of %s", user.first_name)
-    update.message.reply_text('OK, no description. Now select some settings'
+    update.message.reply_text('OK, no description. Now select some settings.\n'
                               'Should the user have a maybe option?',
                               reply_markup=ReplyKeyboardMarkup(settings_keyboard, one_time_keyboard=True))
 
@@ -246,12 +249,12 @@ def settings_maybe(bot, update):
         c = conn.cursor()
         if (update.message.text == 'YES/NO'):
             c.execute('UPDATE surveys SET setting_maybe = ? WHERE ROWID=?', (False, sid))
-            update.message.reply_text('Users will have to choose between yes and no.'
+            update.message.reply_text('Users will have to choose between yes and no.\n'
                                       'Now give up to 10 vote options.',
                                       reply_markup=ReplyKeyboardRemove())
         else:
             c.execute('UPDATE surveys SET setting_maybe = ? WHERE ROWID=?', (True, sid))
-            update.message.reply_text('Users will have to choose between yes, maybe and no. '
+            update.message.reply_text('Users will have to choose between yes, maybe and no.\n'
                                       'Now give up to 10 vote options.',
                                       reply_markup=ReplyKeyboardRemove())
 
@@ -275,6 +278,7 @@ def option(bot, update):
         logger.info("There are %s options for this survey", num)
         if (num == 10):
             update.message.reply_text('OK, 10 options is enough. You are finished-')
+            displaySurvey(bot, s, user.id)
             conn.commit()
             conn.close()
             return ConversationHandler.END
@@ -304,42 +308,53 @@ def cancel(bot, update):
     return ConversationHandler.END
 
 
+def surveyText(s):
+    return ('*%s*\n%s\n' % (s[2], s[3]))
+
+
 def displaySurvey(bot, s, chat_id):
     if (s[4] == 1):
         cols = 3
     else:
         cols = 2
-    msgtext = ('*%s*\n'
-               '%s\n' % (s[2], s[3]))
+    msgtext = surveyText(s)
     so = getSurveyOptions(s)
+    survey_buttons = []
+    survey_buttons.append(InlineKeyboardButton("Share", switch_inline_query="survey-%s" % s[0]))
     bot.send_message(chat_id=chat_id, text=msgtext,
-                     parse_mode=ParseMode.MARKDOWN)
-
+                     parse_mode=ParseMode.MARKDOWN,
+                     reply_markup=InlineKeyboardMarkup(
+                         build_menu(survey_buttons, n_cols=1)))
+    button_list = []
     for opt in so:
         opt = getOptionVotes(opt)
-        button_list = []
+
 
         msgtext = '''*%s*: %s yes, ''' % (opt.text, opt.yes)
         if (s[4] == 1):
             msgtext += '''%s maybe, ''' % opt.maybe
         msgtext += '''%s no\n''' % opt.no
 
-        button_list.append(InlineKeyboardButton("YES", callback_data=('%s-%s-yes' % (s[0], opt.id))))
+        button_list.append(
+            InlineKeyboardButton("YES (%s)" % opt.getYes(), callback_data=('%s-%s-yes' % (s[0], opt.id))))
         if (s[4] == 1):
-            button_list.append(InlineKeyboardButton("MAYBE", callback_data=('%s-%s-maybe' % (s[0], opt.id))))
-        button_list.append(InlineKeyboardButton("NO", callback_data=('%s-%s-no' % (s[0], opt.id))))
+            button_list.append(
+                InlineKeyboardButton("MAYBE (%s)" % opt.getMaybe(), callback_data=('%s-%s-maybe' % (s[0], opt.id))))
+        button_list.append(InlineKeyboardButton("NO (%s)" % opt.getNo(), callback_data=('%s-%s-no' % (s[0], opt.id))))
         bot.send_message(chat_id=chat_id, text=msgtext,
                          reply_markup=InlineKeyboardMarkup(build_menu(button_list, n_cols=cols)),
                          parse_mode=ParseMode.MARKDOWN)
 
+
 def checkUserExistence(user):
     conn = sqlite3.connect('meetbot.db')
     c = conn.cursor()
-    res = c.execute('''SELECT * FROM user WHERE user_id = ?''',(user.id,))
+    res = c.execute('''SELECT * FROM users WHERE user_id = ?''', (user.id,))
     if (len(res.fetchall()) == 0):
-        c.execute('''INSERT INTO user values (?,?,?,?)''',(user.id, user.username, user.first_name, user.last_name))
+        c.execute('''INSERT INTO users values (?,?,?,?)''', (user.id, user.username, user.first_name, user.last_name))
     else:
-        c.execute('''UPDATE user SET username = ?, first_name = ?, name = ? WHERE user_id = ?''',(user.username, user.first_name, user.name, user.id))
+        c.execute('''UPDATE users SET username = ?, first_name = ?, name = ? WHERE user_id = ?''',
+                  (user.username, user.first_name, user.name, user.id))
     conn.commit()
     conn.close()
 
@@ -392,31 +407,87 @@ def updateVote(bot, update, user_data):
             no = 1
         c.execute('''INSERT INTO option_votes VALUES (?,?,?,?,?)''', (option_id, user.id, yes, maybe, no))
     conn.commit()
-    c.execute('''SELECT option FROM survey_options WHERE ROWID = ?''', (option_id,))
-    optres = c.fetchone()
-    opt = SurveyOption(option_id, optres[0])
 
-    opt = getOptionVotes(opt)
-
+    so = getSurveyOptions(s)
     button_list = []
     if (s[4] == 1):
         cols = 3
     else:
         cols = 2
-    msgtext = '''*%s*: %s yes, ''' % (opt.getText(), opt.getYes())
-    if (s[4] == 1):
-        msgtext += '''%s maybe, ''' % opt.getMaybe()
-    msgtext += '''%s no\n''' % opt.no
-    button_list = []
-    button_list.append(InlineKeyboardButton("YES", callback_data=('%s-%s-yes' % (s[0], opt.id))))
-    if (s[4] == 1):
-        button_list.append(InlineKeyboardButton("MAYBE", callback_data=('%s-%s-maybe' % (s[0], opt.id))))
-    button_list.append(InlineKeyboardButton("NO", callback_data=('%s-%s-no' % (s[0], opt.id))))
+    msgtext = surveyText(s)
+    for opt in so:
+        opt = getOptionVotes(opt)
+
+
+        msgtext += '''*%s*: %s yes, ''' % (opt.text, opt.yes)
+        if (s[4] == 1):
+            msgtext += '''%s maybe, ''' % opt.maybe
+        msgtext += '''%s no\n''' % opt.no
+
+        button_list.append(
+            InlineKeyboardButton("YES (%s)" % opt.getYes(), callback_data=('%s-%s-yes' % (s[0], opt.id))))
+        if (s[4] == 1):
+            button_list.append(
+                InlineKeyboardButton("MAYBE (%s)" % opt.getMaybe(), callback_data=('%s-%s-maybe' % (s[0], opt.id))))
+        button_list.append(InlineKeyboardButton("NO (%s)" % opt.getNo(), callback_data=('%s-%s-no' % (s[0], opt.id))))
+
+
     callbackQuery.edit_message_text(text=msgtext,
                                     reply_markup=InlineKeyboardMarkup(build_menu(button_list, n_cols=cols)),
                                     parse_mode=ParseMode.MARKDOWN)
     callbackQuery.answer()
     conn.close()
+
+
+def offerNewSurvey(bot, update):
+    update.inline_query.answer([], switch_pm_text="Create new Survey")
+
+
+def handleInlineQuery(bot, update, user_data):
+    inlineQuery = update.inline_query
+    user = inlineQuery.from_user
+    logger.info(inlineQuery)
+    logger.info(user)
+    surtext, sid = inlineQuery.query.split("-")
+    s = getSurveyById(sid)
+
+    if (s is None):
+        logger.info("No survey found")
+    else :
+        if (s[1] == user.id):
+            resultList = []
+            msgText = surveyText(s)
+            msgText += '\n\nOptions:'
+            so = getSurveyOptions(s)
+            button_list = []
+            if (s[4] == 1):
+                cols = 3
+            else:
+                cols = 2
+
+            for opt in so:
+                msgText += '''\n*%s*: %s yes, ''' % (opt.getText(), opt.getYes())
+                if (s[4] == 1):
+                    msgText += '''%s maybe, ''' % opt.getMaybe()
+                msgText += '''%s no\n''' % opt.no
+                button_list.append(
+                    InlineKeyboardButton("YES (%s)" % opt.getYes(), callback_data=('%s-%s-yes' % (s[0], opt.id))))
+                if (s[4] == 1):
+                    button_list.append(
+                        InlineKeyboardButton("MAYBE (%s)" % opt.getMaybe(), callback_data=('%s-%s-maybe' % (s[0], opt.id))))
+                button_list.append(
+                    InlineKeyboardButton("NO (%s)" % opt.getNo(), callback_data=('%s-%s-no' % (s[0], opt.id))))
+            resultList.append(
+                InlineQueryResultArticle("survey-%s" % (sid,), s[2],
+                    InputTextMessageContent(msgText,parse_mode=ParseMode.MARKDOWN),
+                    reply_markup=InlineKeyboardMarkup(build_menu(button_list, n_cols=cols))))
+            inlineQuery.answer(resultList)
+
+
+def displaySurveyFromInlineHandler(bot, update):
+    logger.info(update)
+    result = update.callback_query
+    logger.info(result)
 
 
 def error(bot, update, error):
@@ -431,21 +502,13 @@ def main():
     survey_id = 0
     updater = Updater(config.get("credentials", "token"))
 
-    conn = sqlite3.connect('meetbot.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id numeric, username text, firstname text, name text)''')
-    c.execute(
-        '''CREATE TABLE IF NOT EXISTS surveys (user_id numeric, title text, description text, setting_maybe numeric)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS survey_options (survey_id numberic, option text)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS option_votes (option_id numberic, user_id numeric,
-       yes numeric, maybe numeric, no numeric)''')
     # Create the EventHandler and pass it your bot's token.
 
     def stop_and_restart(updater):
         """Gracefully stop the Updater and replace the current process with a new one"""
         updater.stop()
         logger.info("Updater stopped")
-        os.execl(sys.executable, sys.executable, *sys.argv)
+        os.execl(sys.executable, os.path.abspath(__file__), *sys.argv)
         logger.info("what am I doing here?")
 
     def restart(bot, update):
@@ -485,8 +548,8 @@ def main():
             f = open('backup/userdata', 'rb')
             dp.user_data = pickle.load(f)
             f.close()
-#        except FileNotFoundError as e:
-#            logger.error("Data file not found")
+        #        except FileNotFoundError as e:
+        #            logger.error("Data file not found")
         except:
             logger.error(sys.exc_info()[0])
 
@@ -520,6 +583,10 @@ def main():
 
     dp.add_handler(CommandHandler('restart', restart, filters=Filters.user(username='@cnarg')))
 
+    dp.add_handler(InlineQueryHandler(handleInlineQuery, pattern="survey-", pass_user_data=True))
+    dp.add_handler(InlineQueryHandler(offerNewSurvey, pattern="^$", pass_user_data=True))
+
+    dp.add_handler(ChosenInlineResultHandler(displaySurveyFromInlineHandler, pass_user_data=True, pass_chat_data=True))
 
     dp.add_handler(cb_handler)
 
